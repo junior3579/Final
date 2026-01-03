@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: stake-arena
+    env: python
+    buildCommand: "./build.sh"
+    startCommand: "gunicorn --worker-class eventlet -w 1 backend.main:app"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: PORT
+        value: 10000
+    autoDeploy: true
