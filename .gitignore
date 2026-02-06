@@ -1,0 +1,9 @@
+.env
+__pycache__/
+*.pyc
+node_modules/
+dist/
+.DS_Store
+backend/static/*
+!backend/static/index.html
+!backend/static/assets/

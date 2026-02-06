@@ -1,59 +1,70 @@
 
-import sqlite3
+import psycopg2
+from psycopg2 import pool
 import os
 from datetime import datetime, timezone
 
-# Caminho para o banco de dados SQLite local
-DB_PATH = os.path.join(os.path.dirname(__file__), "stake_arena_local.db")
+# Configuração do Neon Postgres
+NEON_DATABASE_URL = os.environ.get("DATABASE_URL", "postgresql://neondb_owner:npg_V8qafPvicJO4@ep-crimson-queen-acirpfh4-pooler.sa-east-1.aws.neon.tech/neondb?sslmode=require")
 
-def conectar_banco_local():
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        return conn
-    except Exception as e:
-        print(f"Erro ao conectar ao banco local: {e}")
+# Pool de conexões para eficiência
+try:
+    connection_pool = psycopg2.pool.SimpleConnectionPool(
+        1, 10, NEON_DATABASE_URL
+    )
+except Exception as e:
+    print(f"Erro ao criar pool de conexões Neon: {e}")
+    connection_pool = None
+
+def conectar_banco_remoto():
+    if not connection_pool:
         return None
+    try:
+        return connection_pool.getconn()
+    except Exception as e:
+        print(f"Erro ao obter conexão do pool: {e}")
+        return None
+
+def liberar_conexao(conn):
+    if connection_pool and conn:
+        connection_pool.putconn(conn)
 
 def executar_query_fetchall(query, params=()):
-    # Converter sintaxe PostgreSQL (%s) para SQLite (?)
-    query = query.replace("%s", "?")
-    conn = conectar_banco_local()
+    conn = conectar_banco_remoto()
     if not conn:
         return None
     try:
-        cursor = conn.cursor()
-        cursor.execute(query, params)
-        result = cursor.fetchall()
-        return result
+        with conn.cursor() as cursor:
+            cursor.execute(query, params)
+            result = cursor.fetchall()
+            return result
     except Exception as e:
-        print(f"Erro na query: {e}")
+        print(f"Erro na query fetchall: {e}")
         return None
     finally:
-        conn.close()
+        liberar_conexao(conn)
 
 def executar_query_commit(query, params=()):
-    # Converter sintaxe PostgreSQL (%s) para SQLite (?)
-    query = query.replace("%s", "?")
-    conn = conectar_banco_local()
+    conn = conectar_banco_remoto()
     if not conn:
         return False
     try:
-        cursor = conn.cursor()
-        cursor.execute(query, params)
-        conn.commit()
-        return True
+        with conn.cursor() as cursor:
+            cursor.execute(query, params)
+            conn.commit()
+            return True
     except Exception as e:
-        print(f"Erro na query: {e}")
+        print(f"Erro na query commit: {e}")
+        conn.rollback()
         return False
     finally:
-        conn.close()
+        liberar_conexao(conn)
 
 def criar_tabelas_remoto():
-    # Mantendo o nome da função para compatibilidade com main.py
     queries = [
         '''
         CREATE TABLE IF NOT EXISTS usuarios (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             nome TEXT NOT NULL UNIQUE,
             senha TEXT NOT NULL,
             pontos INTEGER NOT NULL,
@@ -65,63 +76,56 @@ def criar_tabelas_remoto():
         )
         ''',
         '''
+        CREATE TABLE IF NOT EXISTS categorias (
+            id SERIAL PRIMARY KEY,
+            nome TEXT NOT NULL UNIQUE
+        )
+        ''',
+        '''
         CREATE TABLE IF NOT EXISTS salas (
-            id_sala INTEGER PRIMARY KEY AUTOINCREMENT,
+            id_sala SERIAL PRIMARY KEY,
             nome_sala TEXT NOT NULL,
             valor_inicial INTEGER NOT NULL,
             criador TEXT NOT NULL,
             jogadores TEXT,
             whatsapp TEXT,
-            categoria_id INTEGER,
-            FOREIGN KEY(categoria_id) REFERENCES categorias(id)
+            categoria_id INTEGER REFERENCES categorias(id)
         )
         ''',
         '''
         CREATE TABLE IF NOT EXISTS apostas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            id_sala INTEGER NOT NULL,
-            id_usuario INTEGER NOT NULL,
+            id SERIAL PRIMARY KEY,
+            id_sala INTEGER NOT NULL REFERENCES salas(id_sala),
+            id_usuario INTEGER NOT NULL REFERENCES usuarios(id),
             valor_aposta INTEGER NOT NULL,
             status TEXT DEFAULT 'pendente',
-            resultado TEXT DEFAULT 'pendente',
-            FOREIGN KEY(id_sala) REFERENCES salas(id_sala),
-            FOREIGN KEY(id_usuario) REFERENCES usuarios(id)
+            resultado TEXT DEFAULT 'pendente'
         )
         ''',
         '''
         CREATE TABLE IF NOT EXISTS transacoes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            id_usuario INTEGER NOT NULL,
+            id SERIAL PRIMARY KEY,
+            id_usuario INTEGER NOT NULL REFERENCES usuarios(id),
             tipo TEXT NOT NULL,
             valor INTEGER NOT NULL,
             status TEXT DEFAULT 'pendente',
-            data_criacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(id_usuario) REFERENCES usuarios(id)
-        )
-        ''',
-        '''
-        CREATE TABLE IF NOT EXISTS categorias (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            nome TEXT NOT NULL UNIQUE
+            data_criacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
         ''',
         '''
         CREATE TABLE IF NOT EXISTS torneios (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             nome TEXT NOT NULL,
-            status TEXT DEFAULT 'inscricao', -- inscricao, em_andamento, finalizado
-            vencedor_id INTEGER,
-            FOREIGN KEY(vencedor_id) REFERENCES usuarios(id)
+            status TEXT DEFAULT 'inscricao',
+            vencedor_id INTEGER REFERENCES usuarios(id)
         )
         ''',
         '''
         CREATE TABLE IF NOT EXISTS torneio_participantes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            torneio_id INTEGER NOT NULL,
-            usuario_id INTEGER NOT NULL,
-            status TEXT DEFAULT 'ativo', -- ativo, eliminado
-            FOREIGN KEY(torneio_id) REFERENCES torneios(id),
-            FOREIGN KEY(usuario_id) REFERENCES usuarios(id)
+            id SERIAL PRIMARY KEY,
+            torneio_id INTEGER NOT NULL REFERENCES torneios(id),
+            usuario_id INTEGER NOT NULL REFERENCES usuarios(id),
+            status TEXT DEFAULT 'ativo'
         )
         '''
     ]
@@ -137,7 +141,7 @@ def reordenar_posicoes():
     
     for index, (user_id,) in enumerate(usuarios, start=1):
         executar_query_commit(
-            "UPDATE usuarios SET posicao = ? WHERE id = ?",
+            "UPDATE usuarios SET posicao = %s WHERE id = %s",
             (index, user_id)
         )
 
@@ -151,9 +155,6 @@ def obter_proxima_posicao_vaga():
     return pos
 
 def obter_menor_id_vago():
-    """
-    Encontra o menor ID disponível na tabela usuarios para reutilização.
-    """
     result = executar_query_fetchall("SELECT id FROM usuarios ORDER BY id")
     ids_ocupados = {r[0] for r in result}
     
@@ -164,25 +165,25 @@ def obter_menor_id_vago():
 
 def atualizar_atividade_usuario(id_usuario):
     executar_query_commit(
-        "UPDATE usuarios SET last_seen = ? WHERE id = ?",
-        (datetime.now(timezone.utc).isoformat(), id_usuario)
+        "UPDATE usuarios SET last_seen = %s WHERE id = %s",
+        (datetime.now(timezone.utc), id_usuario)
     )
 
 def listar_usuarios_online(minutos=5):
     from datetime import timedelta
-    limite = (datetime.now(timezone.utc) - timedelta(minutes=minutos)).isoformat()
+    limite = datetime.now(timezone.utc) - timedelta(minutes=minutos)
     result = executar_query_fetchall(
-        "SELECT nome, last_seen FROM usuarios WHERE last_seen >= ? ORDER BY last_seen DESC",
+        "SELECT nome, last_seen FROM usuarios WHERE last_seen >= %s ORDER BY last_seen DESC",
         (limite,)
     )
     if not result:
         return []
     
     usuarios_online = []
-    for nome, last_seen_str in result:
-        if last_seen_str:
+    for nome, last_seen in result:
+        if last_seen:
             try:
-                last_seen = datetime.fromisoformat(last_seen_str)
+                # last_seen já deve ser um objeto datetime vindo do psycopg2
                 last_seen_local = last_seen - timedelta(hours=3)
                 usuarios_online.append({
                     'nome': nome,
